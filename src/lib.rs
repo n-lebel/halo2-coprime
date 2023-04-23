@@ -1,1 +1,1 @@
-mod gcd;
+mod coprime;
