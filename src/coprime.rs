@@ -9,6 +9,24 @@ use halo2_proofs::{
 mod table;
 use table::*;
 
+/// This module assigns the GCD of two integers through Euclid's algorithm, 
+/// and assigns the LCM in another region. The results can be then exposed
+/// in an instance column.
+///
+// +-----------+-------+------------+----------+-------+-------+----------+
+// | col_a     | col_b | col_c      | q_euclid | q_gcd | q_lcm | q_range  |
+// +-----------+-------+------------+----------+-------+-------+----------+
+// | a         | b     | a // b     | 0        | 0     | 0     | 1        |
+// | b         | a%b   | b // (a%b) | 1        | 0     | 0     | 1        |
+// | ...       | ...   | ...        | 1        | 0     | 0     | 1        |
+// | gcd(a, b) | 0     | 0          | 1        | 1     | 0     | 1        |
+// |           |       |            |          |       |       |          |
+// | a         | b     | gcd(a, b)  | 0        | 0     | 1     | 0        |
+// | lcm(a, b) |       |            | 0        | 0     | 0     | 0        |
+// +-----------+-------+------------+----------+-------+-------+----------+
+
+
+
 #[derive(Debug, Clone)]
 pub struct CoprimeConfig<F: FieldExt, const RANGE: usize> {
     a: Column<Advice>,
@@ -19,7 +37,8 @@ pub struct CoprimeConfig<F: FieldExt, const RANGE: usize> {
 
     range_check: RangeTableConfig<F, RANGE>,
 
-    q_lookup: Selector,
+    q_range: Selector,
+    q_euclid: Selector,
     q_gcd: Selector,
     q_lcm: Selector,
 }
@@ -40,14 +59,15 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
 
         let range_check = RangeTableConfig::<F, RANGE>::configure(meta);
 
-        let q_lookup = meta.complex_selector();
+        let q_range = meta.complex_selector();
+        let q_euclid = meta.selector();
         let q_gcd = meta.selector();
         let q_lcm = meta.selector();
 
         // Verify that this is a valid Euclid's algorithm step
         // No overflows possible in the constraints as long as RANGE doesn't exceed p/2
         meta.create_gate("euclid's algorithm check", |meta| {
-            let q_gcd = meta.query_selector(q_gcd);
+            let q_euclid = meta.query_selector(q_euclid);
 
             let a_prev = meta.query_advice(a, Rotation::prev());
             let b_prev = meta.query_advice(b, Rotation::prev());
@@ -57,7 +77,7 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
             let b_cur = meta.query_advice(b, Rotation::cur());
 
             Constraints::with_selector(
-                q_gcd,
+                q_euclid,
                 [
                     ("a_cur == b_prev", a_cur - b_prev.clone()),
                     (
@@ -66,6 +86,18 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
                     ),
                 ],
             )
+        });
+
+        // Verify that the given row is a final state of a Euclid algorithm
+        // Means only the first row is nonzero
+        meta.create_gate("gcd check", |meta| {
+            let q_gcd = meta.query_selector(q_gcd);
+
+            let a_cur = meta.query_advice(a, Rotation::cur()); // GCD
+            let b_cur = meta.query_advice(b, Rotation::cur()); // 0
+            let c_cur = meta.query_advice(c, Rotation::cur()); // 0
+
+            Constraints::with_selector(q_gcd, [("b_cur = 0", b_cur), ("c_cur = 0", c_cur)])
         });
 
         // Verify that the provided LCM = a * b / GCD(a, b)
@@ -87,24 +119,24 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
 
         // Constrain all elements of current row to 0..RANGE
         meta.lookup(|meta| {
-            let q_lookup = meta.query_selector(q_lookup);
+            let q_range = meta.query_selector(q_range);
             let a_cur = meta.query_advice(a, Rotation::cur());
 
-            vec![(q_lookup * a_cur, range_check.value)]
+            vec![(q_range * a_cur, range_check.value)]
         });
 
         meta.lookup(|meta| {
-            let q_lookup = meta.query_selector(q_lookup);
+            let q_range = meta.query_selector(q_range);
             let b_cur = meta.query_advice(b, Rotation::cur());
 
-            vec![(q_lookup * b_cur, range_check.value)]
+            vec![(q_range * b_cur, range_check.value)]
         });
 
         meta.lookup(|meta| {
-            let q_lookup = meta.query_selector(q_lookup);
+            let q_range = meta.query_selector(q_range);
             let c_cur = meta.query_advice(c, Rotation::cur());
 
-            vec![(q_lookup * c_cur, range_check.value)]
+            vec![(q_range * c_cur, range_check.value)]
         });
 
         CoprimeConfig {
@@ -113,7 +145,8 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
             c,
             exp,
             range_check,
-            q_lookup,
+            q_range,
+            q_euclid,
             q_gcd,
             q_lcm,
         }
@@ -173,7 +206,7 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
                 let euclid_steps = Self::euclid_gcd_steps(a, b);
 
                 // enable the selectors
-                self.q_lookup.enable(&mut region, offset)?;
+                self.q_range.enable(&mut region, offset)?;
 
                 // assign the first cells
                 let mut cell_a = region.assign_advice(
@@ -201,8 +234,14 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
 
                 // iterate over the steps and assign the witness accordingly
                 for (i, (a, b, div)) in euclid_steps[1..].iter().enumerate() {
-                    self.q_gcd.enable(&mut region, offset + i + 1)?;
-                    self.q_lookup.enable(&mut region, offset + i + 1)?;
+                    self.q_euclid.enable(&mut region, offset + i + 1)?;
+                    self.q_range.enable(&mut region, offset + i + 1)?;
+
+                    // enable the GCD check on that last row
+                    if i == euclid_steps.len() - 1 {
+                        println!("Success");
+                        self.q_gcd.enable(&mut region, offset + i + 1)?;
+                    }
 
                     cell_a = region.assign_advice(
                         || "a",
