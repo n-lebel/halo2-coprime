@@ -1,31 +1,32 @@
 use halo2_proofs::circuit::Value;
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, SimpleFloorPlanner},
-    pasta::Fp,
     plonk::{Advice, Circuit, Column, ConstraintSystem, Constraints, Error, Instance, Selector},
     poly::Rotation,
+    arithmetic::FieldExt
 };
 
 mod table;
 use table::*;
 
 #[derive(Debug, Clone)]
-struct CoprimeConfig<const RANGE: usize> {
+pub struct CoprimeConfig<F: FieldExt, const RANGE: usize> {
     a: Column<Advice>,
     b: Column<Advice>,
     c: Column<Advice>,
 
     exp: Column<Instance>,
 
-    range_check: RangeTableConfig<Fp, RANGE>,
+    range_check: RangeTableConfig<F, RANGE>,
 
     q_lookup: Selector,
     q_gcd: Selector,
     q_lcm: Selector,
 }
 
-impl<const RANGE: usize> CoprimeConfig<RANGE> {
-    fn configure(meta: &mut ConstraintSystem<Fp>) -> Self {
+
+impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
+    fn configure(meta: &mut ConstraintSystem<F>) -> Self {
         let a = meta.advice_column();
         let b = meta.advice_column();
         let c = meta.advice_column();
@@ -37,7 +38,7 @@ impl<const RANGE: usize> CoprimeConfig<RANGE> {
         meta.enable_equality(c);
         meta.enable_equality(exp);
 
-        let range_check = RangeTableConfig::<Fp, RANGE>::configure(meta);
+        let range_check = RangeTableConfig::<F, RANGE>::configure(meta);
 
         let q_lookup = meta.complex_selector();
         let q_gcd = meta.selector();
@@ -118,7 +119,7 @@ impl<const RANGE: usize> CoprimeConfig<RANGE> {
         }
     }
 
-    fn euclid_gcd_steps(mut a: u64, mut b: u64) -> Vec<(u64, u64, u64)> {
+    fn euclid_gcd_steps(mut a: u128, mut b: u128) -> Vec<(u128, u128, u128)> {
         let mut steps_data = Vec::new();
 
         while b != 0 {
@@ -135,7 +136,7 @@ impl<const RANGE: usize> CoprimeConfig<RANGE> {
         steps_data
     }
 
-    fn calculate_lcm(mut a: u64, mut b: u64) -> u64 {
+    fn calculate_lcm(mut a: u128, mut b: u128) -> u128 {
         let ab = a * b;
 
         while b != 0 {
@@ -148,18 +149,18 @@ impl<const RANGE: usize> CoprimeConfig<RANGE> {
         ab / a // a*b divided by GCD
     }
 
-    fn assign_gcd(
+    pub fn assign_gcd(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        a: u64,
-        b: u64,
+        mut layouter: impl Layouter<F>,
+        a: u128,
+        b: u128,
     ) -> Result<
         (
             (
-                AssignedCell<Fp, Fp>, // a
-                AssignedCell<Fp, Fp>, // b
+                AssignedCell<F, F>, // a
+                AssignedCell<F, F>, // b
             ),
-            AssignedCell<Fp, Fp>, // GCD(a, b)
+            AssignedCell<F, F>, // GCD(a, b)
         ),
         Error,
     > {
@@ -179,19 +180,19 @@ impl<const RANGE: usize> CoprimeConfig<RANGE> {
                     || "a init",
                     self.a,
                     offset,
-                    || Value::known(Fp::from(a)),
+                    || Value::known(F::from_u128(a)),
                 )?;
                 let cell_b = region.assign_advice(
                     || "b init",
                     self.b,
                     offset,
-                    || Value::known(Fp::from(b)),
+                    || Value::known(F::from_u128(b)),
                 )?;
                 region.assign_advice(
                     || "div init",
                     self.c,
                     offset,
-                    || Value::known(Fp::from(a / b)),
+                    || Value::known(F::from_u128(a / b)),
                 )?;
 
                 // Store to return in the end
@@ -207,21 +208,21 @@ impl<const RANGE: usize> CoprimeConfig<RANGE> {
                         || "a",
                         self.a,
                         offset + i + 1,
-                        || Value::known(Fp::from(a.clone())),
+                        || Value::known(F::from_u128(a.clone())),
                     )?;
 
                     region.assign_advice(
                         || "b",
                         self.b,
                         offset + i + 1,
-                        || Value::known(Fp::from(b.clone())),
+                        || Value::known(F::from_u128(b.clone())),
                     )?;
 
                     region.assign_advice(
                         || "div",
                         self.c,
                         offset + i + 1,
-                        || Value::known(Fp::from(div.clone())),
+                        || Value::known(F::from_u128(div.clone())),
                     )?;
                 }
 
@@ -230,15 +231,15 @@ impl<const RANGE: usize> CoprimeConfig<RANGE> {
         )
     }
 
-    fn assign_lcm(
+    pub fn assign_lcm(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        a: u64,
-        b: u64,
+        mut layouter: impl Layouter<F>,
+        a: u128,
+        b: u128,
     ) -> Result<
         (
-            (AssignedCell<Fp, Fp>, AssignedCell<Fp, Fp>),
-            AssignedCell<Fp, Fp>,
+            (AssignedCell<F, F>, AssignedCell<F, F>),
+            AssignedCell<F, F>,
         ),
         Error,
     > {
@@ -262,7 +263,7 @@ impl<const RANGE: usize> CoprimeConfig<RANGE> {
                     || "lcm",
                     self.a,
                     offset + 1,
-                    || Value::known(Fp::from(lcm)),
+                    || Value::known(F::from_u128(lcm)),
                 )?;
 
                 Ok(((cell_a, cell_b), cell_lcm))
@@ -272,8 +273,8 @@ impl<const RANGE: usize> CoprimeConfig<RANGE> {
 
     pub fn expose_public(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        cell: AssignedCell<Fp, Fp>,
+        mut layouter: impl Layouter<F>,
+        cell: AssignedCell<F, F>,
         row: usize,
     ) -> Result<(), Error> {
         layouter.constrain_instance(cell.cell(), self.exp, row)?;
@@ -286,7 +287,8 @@ impl<const RANGE: usize> CoprimeConfig<RANGE> {
 mod tests {
     use super::*;
     use gcd::*;
-    use halo2_proofs::dev::{FailureLocation, MockProver, VerifyFailure};
+    use halo2_proofs::{dev::{FailureLocation, MockProver, VerifyFailure},     pasta::Fp,
+};
     use rand::prelude::SliceRandom;
 
     fn sample_values_from_vec<T: Clone>(input: &Vec<T>, n: usize) -> Vec<T> {
@@ -310,26 +312,26 @@ mod tests {
 
         #[derive(Default, Clone)]
         struct GcdCircuit<const RANGE: usize> {
-            a: u64,
-            b: u64,
+            a: u128,
+            b: u128,
         }
 
-        impl<const RANGE: usize> Circuit<Fp> for GcdCircuit<RANGE> {
-            type Config = CoprimeConfig<RANGE>;
+        impl<F: FieldExt, const RANGE: usize> Circuit<F> for GcdCircuit<RANGE> {
+            type Config = CoprimeConfig<F, RANGE>;
             type FloorPlanner = SimpleFloorPlanner;
 
             fn without_witnesses(&self) -> Self {
                 Self::default()
             }
 
-            fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
+            fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
                 CoprimeConfig::configure(meta)
             }
 
             fn synthesize(
                 &self,
                 config: Self::Config,
-                mut layouter: impl Layouter<Fp>,
+                mut layouter: impl Layouter<F>,
             ) -> Result<(), Error> {
                 // populate the lookup table cells
                 config.range_check.load(&mut layouter)?;
@@ -350,9 +352,9 @@ mod tests {
 
             for i in sample_values_from_vec(&(1..RANGE).collect(), 5000) {
                 for j in sample_values_from_vec(&(1..RANGE).collect(), 5000) {
-                    let res = CoprimeConfig::<RANGE>::euclid_gcd_steps(i as u64, j as u64);
+                    let res = CoprimeConfig::<Fp, RANGE>::euclid_gcd_steps(i as u128, j as u128);
                     let (a, b, _) = res.last().unwrap();
-                    let gcd = euclid_u64(i as u64, j as u64);
+                    let gcd = euclid_u128(i as u128, j as u128);
 
                     assert_eq!(a, &gcd);
                     assert_eq!(b, &0);
@@ -370,17 +372,17 @@ mod tests {
             for i in sample_values_from_vec(&(1..RANGE).collect(), 50) {
                 for j in sample_values_from_vec(&(1..RANGE).collect(), 50) {
                     let circuit = GcdCircuit::<RANGE> {
-                        a: i as u64,
-                        b: j as u64,
+                        a: i as u128,
+                        b: j as u128,
                     };
 
-                    let res = CoprimeConfig::<RANGE>::euclid_gcd_steps(i as u64, j as u64);
+                    let res = CoprimeConfig::<Fp, RANGE>::euclid_gcd_steps(i as u128, j as u128);
                     let (a, b, c) = res.last().unwrap();
 
                     let instance = vec![vec![
-                        Fp::from(a.clone()),
-                        Fp::from(b.clone()),
-                        Fp::from(c.clone()),
+                        Fp::from_u128(a.clone()),
+                        Fp::from_u128(b.clone()),
+                        Fp::from_u128(c.clone()),
                     ]];
                     let prover = MockProver::<Fp>::run(k, &circuit, instance).unwrap();
 
@@ -391,8 +393,8 @@ mod tests {
             // Unsuccessful case
             // Out-of-range `a = b = RANGE`
             let circuit = GcdCircuit::<RANGE> {
-                a: RANGE as u64,
-                b: RANGE as u64,
+                a: RANGE as u128,
+                b: RANGE as u128,
             };
 
             let prover = MockProver::run(k, &circuit, vec![vec![Fp::from(RANGE as u64)]]).unwrap();
@@ -430,26 +432,26 @@ mod tests {
 
         #[derive(Default, Clone)]
         struct LcmCircuit<const RANGE: usize> {
-            a: u64,
-            b: u64,
+            a: u128,
+            b: u128,
         }
 
-        impl<const RANGE: usize> Circuit<Fp> for LcmCircuit<RANGE> {
-            type Config = CoprimeConfig<RANGE>;
+        impl<F: FieldExt, const RANGE: usize> Circuit<F> for LcmCircuit<RANGE> {
+            type Config = CoprimeConfig<F, RANGE>;
             type FloorPlanner = SimpleFloorPlanner;
 
             fn without_witnesses(&self) -> Self {
                 Self::default()
             }
 
-            fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
+            fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
                 CoprimeConfig::configure(meta)
             }
 
             fn synthesize(
                 &self,
                 config: Self::Config,
-                mut layouter: impl Layouter<Fp>,
+                mut layouter: impl Layouter<F>,
             ) -> Result<(), Error> {
                 // populate the lookup table cells
                 config.range_check.load(&mut layouter)?;
@@ -470,10 +472,10 @@ mod tests {
 
             for i in sample_values_from_vec(&(1..RANGE).collect(), 5000) {
                 for j in sample_values_from_vec(&(1..RANGE).collect(), 5000) {
-                    let lcm = CoprimeConfig::<RANGE>::calculate_lcm(i as u64, j as u64);
+                    let lcm = CoprimeConfig::<Fp, RANGE>::calculate_lcm(i as u128, j as u128);
 
-                    let gcd = euclid_u64(i as u64, j as u64);
-                    let ref_lcm = (i as u64) * (j as u64) / gcd;
+                    let gcd = euclid_u128(i as u128, j as u128);
+                    let ref_lcm = (i as u128) * (j as u128) / gcd;
 
                     assert_eq!(ref_lcm, lcm);
                 }
@@ -490,13 +492,13 @@ mod tests {
             for i in sample_values_from_vec(&(1..RANGE).collect(), 50) {
                 for j in sample_values_from_vec(&(1..RANGE).collect(), 50) {
                     let circuit = LcmCircuit::<RANGE> {
-                        a: i as u64,
-                        b: j as u64,
+                        a: i as u128,
+                        b: j as u128,
                     };
 
-                    let lcm = CoprimeConfig::<RANGE>::calculate_lcm(i as u64, j as u64);
+                    let lcm = CoprimeConfig::<Fp, RANGE>::calculate_lcm(i as u128, j as u128);
 
-                    let instance = vec![vec![Fp::from(lcm)]];
+                    let instance = vec![vec![Fp::from_u128(lcm)]];
                     let prover = MockProver::<Fp>::run(k, &circuit, instance).unwrap();
 
                     prover.assert_satisfied();
@@ -506,12 +508,12 @@ mod tests {
             // Unsuccessful case
             // Out-of-range `a = b = RANGE`
             let circuit = LcmCircuit::<RANGE> {
-                a: RANGE as u64,
-                b: RANGE as u64,
+                a: RANGE as u128,
+                b: RANGE as u128,
             };
 
             let prover =
-                MockProver::run(k, &circuit, vec![vec![Fp::from(RANGE as u64)]]).unwrap();
+                MockProver::run(k, &circuit, vec![vec![Fp::from_u128(RANGE as u128)]]).unwrap();
             assert_eq!(
                 prover.verify(),
                 Err(vec![
