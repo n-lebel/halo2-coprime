@@ -13,18 +13,17 @@ use table::*;
 /// and assigns the LCM in another region. The results can be then exposed
 /// in an instance column.
 ///
-// +-----------+-------+------------+----------+-------+-------+----------+
-// | col_a     | col_b | col_c      | q_euclid | q_gcd | q_lcm | q_range  |
-// +-----------+-------+------------+----------+-------+-------+----------+
-// | a         | b     | a // b     | 0        | 0     | 0     | 1        |
-// | b         | a%b   | b // (a%b) | 1        | 0     | 0     | 1        |
-// | ...       | ...   | ...        | 1        | 0     | 0     | 1        |
-// | gcd(a, b) | 0     | 0          | 1        | 1     | 0     | 1        |
-// |           |       |            |          |       |       |          |
-// | a         | b     | gcd(a, b)  | 0        | 0     | 1     | 0        |
-// | lcm(a, b) |       |            | 0        | 0     | 0     | 0        |
-// +-----------+-------+------------+----------+-------+-------+----------+
-
+// +-----------+----------+------------+----------+-------+-------+----------+
+// | col_a     | col_b    | col_c      | q_euclid | q_gcd | q_lcm | q_lookup |
+// +-----------+----------+------------+----------+-------+-------+----------+
+// | a         | b        | a // b     | 0        | 0     | 0     | 1        |
+// | b         | a%b      | b // (a%b) | 1        | 0     | 0     | 1        |
+// | ...       | ...      | ...        | 1        | 0     | 0     | 1        |
+// | gcd(a, b) | 0        | 0          | 1        | 1     | 0     | 1        |
+// |           |          |            |          |       |       |          |
+// | a         | b        |            | 0        | 0     | 1     | 0        |
+// | gcd(a, b) | lcm(a,b) |            | 0        | 0     | 0     | 0        |
+// +-----------+----------+------------+----------+-------+-------+----------+
 
 
 #[derive(Debug, Clone)]
@@ -54,7 +53,6 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
 
         meta.enable_equality(a);
         meta.enable_equality(b);
-        meta.enable_equality(c);
         meta.enable_equality(exp);
 
         let range_check = RangeTableConfig::<F, RANGE>::configure(meta);
@@ -89,7 +87,7 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
         });
 
         // Verify that the given row is a final state of a Euclid algorithm
-        // Means only the first row is nonzero
+        // Means one of both a and b is zero 
         meta.create_gate("gcd check", |meta| {
             let q_gcd = meta.query_selector(q_gcd);
 
@@ -97,7 +95,7 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
             let b_cur = meta.query_advice(b, Rotation::cur()); // 0
             let c_cur = meta.query_advice(c, Rotation::cur()); // 0
 
-            Constraints::with_selector(q_gcd, [("b_cur = 0", b_cur), ("c_cur = 0", c_cur)])
+            Constraints::with_selector(q_gcd, [("a_cur = 0 or b_cur = 0", a_cur*b_cur)])
         });
 
         // Verify that the provided LCM = a * b / GCD(a, b)
@@ -107,13 +105,14 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
 
             let a_cur = meta.query_advice(a, Rotation::cur()); // a
             let b_cur = meta.query_advice(b, Rotation::cur()); // b
-            let c_cur = meta.query_advice(c, Rotation::cur()); // GCD
 
-            let a_next = meta.query_advice(a, Rotation::next()); // LCM
+            let a_next = meta.query_advice(a, Rotation::next()); // GCD
+            let b_next = meta.query_advice(b, Rotation::next()); // LCM
+
 
             Constraints::with_selector(
                 q_lcm,
-                [("lcm * gcd == a_cur * b_cur", a_cur * b_cur - c_cur * a_next)],
+                [("lcm * gcd == a_cur * b_cur", a_cur * b_cur - a_next * b_next)],
             )
         });
 
@@ -277,8 +276,8 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
         b: u128,
     ) -> Result<
         (
-            (AssignedCell<F, F>, AssignedCell<F, F>),
-            AssignedCell<F, F>,
+            (AssignedCell<F, F>, AssignedCell<F, F>), // a, b
+            (AssignedCell<F, F>, AssignedCell<F, F>) // gcd, lcm
         ),
         Error,
     > {
@@ -296,16 +295,16 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
 
                 let cell_a = cell_a.copy_advice(|| "a", &mut region, self.a, offset)?;
                 let cell_b = cell_b.copy_advice(|| "b", &mut region, self.b, offset)?;
-                cell_gcd.copy_advice(|| "gcd", &mut region, self.c, offset)?;
+                let cell_gcd = cell_gcd.copy_advice(|| "gcd", &mut region, self.a, offset+1)?;
 
                 let cell_lcm = region.assign_advice(
                     || "lcm",
-                    self.a,
+                    self.b,
                     offset + 1,
                     || Value::known(F::from_u128(lcm)),
                 )?;
 
-                Ok(((cell_a, cell_b), cell_lcm))
+                Ok(((cell_a, cell_b), (cell_gcd, cell_lcm)))
             },
         )
     }
@@ -496,7 +495,7 @@ mod tests {
                 config.range_check.load(&mut layouter)?;
 
                 // assign the full Euclid's algorithm
-                let (_, cell_lcm) =
+                let (_, (_ ,cell_lcm)) =
                     config.assign_lcm(layouter.namespace(|| "assign lcm block"), self.a, self.b)?;
                 // expose the last step which contains the GCD of the two inputs
                 config.expose_public(layouter.namespace(|| "expose the lcm"), cell_lcm, 0)?;
