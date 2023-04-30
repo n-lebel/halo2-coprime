@@ -1,29 +1,32 @@
 use halo2_proofs::circuit::Value;
 use halo2_proofs::{
+    arithmetic::FieldExt,
     circuit::{AssignedCell, Layouter, SimpleFloorPlanner},
-    plonk::{Advice, Circuit, Column, ConstraintSystem, Constraints, Error, Instance, Selector},
+    plonk::{
+        Advice, Circuit, Column, ConstraintSystem, Constraints, Error, Expression, Instance,
+        Selector,
+    },
     poly::Rotation,
-    arithmetic::FieldExt
 };
 
 mod table;
 use table::*;
 
-/// This module assigns the GCD of two integers through Euclid's algorithm, 
+/// This module assigns the GCD of two integers through Euclid's algorithm,
 /// and assigns the LCM in another region. The results can be then exposed
 /// in an instance column.
 ///
-// +-----------+----------+------------+----------+-------+-------+----------+
-// | col_a     | col_b    | col_c      | q_euclid | q_gcd | q_lcm | q_lookup |
-// +-----------+----------+------------+----------+-------+-------+----------+
-// | a         | b        | a // b     | 0        | 0     | 0     | 1        |
-// | b         | a%b      | b // (a%b) | 1        | 0     | 0     | 1        |
-// | ...       | ...      | ...        | 1        | 0     | 0     | 1        |
-// | gcd(a, b) | 0        | 0          | 1        | 1     | 0     | 1        |
-// |           |          |            |          |       |       |          |
-// | a         | b        |            | 0        | 0     | 1     | 0        |
-// | gcd(a, b) | lcm(a,b) |            | 0        | 0     | 0     | 0        |
-// +-----------+----------+------------+----------+-------+-------+----------+
+// +-----------+----------+------------+----------+-------+-----------+-------+----------+
+// | col_a     | col_b    | col_c      | q_euclid | q_gcd | q_coprime | q_lcm | q_lookup |
+// +-----------+----------+------------+----------+-------+-----------+-------+----------+
+// | a         | b        | a // b     | 0        | 0     | 0         | 0     | 1        |
+// | b         | a%b      | b // (a%b) | 1        | 0     | 0         | 0     | 1        |
+// | ...       | ...      | ...        | 1        | 0     | 0         | 0     | 1        |
+// | gcd(a, b) | 0        | 0          | 1        | 1     | 0/1       | 0     | 1        |
+// |           |          |            |          |       |           |       |          |
+// | a         | b        |            | 0        | 0     | 0         | 1     | 0        |
+// | gcd(a, b) | lcm(a,b) |            | 0        | 0     | 0         | 0     | 0        |
+// +-----------+----------+------------+----------+-------+-----------+-------+----------+
 
 
 #[derive(Debug, Clone)]
@@ -39,9 +42,9 @@ pub struct CoprimeConfig<F: FieldExt, const RANGE: usize> {
     q_range: Selector,
     q_euclid: Selector,
     q_gcd: Selector,
+    q_coprime: Selector,
     q_lcm: Selector,
 }
-
 
 impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
     fn configure(meta: &mut ConstraintSystem<F>) -> Self {
@@ -60,6 +63,7 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
         let q_range = meta.complex_selector();
         let q_euclid = meta.selector();
         let q_gcd = meta.selector();
+        let q_coprime = meta.selector();
         let q_lcm = meta.selector();
 
         // Verify that this is a valid Euclid's algorithm step
@@ -87,15 +91,29 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
         });
 
         // Verify that the given row is a final state of a Euclid algorithm
-        // Means one of both a and b is zero 
+        // Means only a is nonzero
+        // MUST be used with q_euclid to check for valid transition
         meta.create_gate("gcd check", |meta| {
             let q_gcd = meta.query_selector(q_gcd);
 
-            let a_cur = meta.query_advice(a, Rotation::cur()); // GCD
             let b_cur = meta.query_advice(b, Rotation::cur()); // 0
             let c_cur = meta.query_advice(c, Rotation::cur()); // 0
 
-            Constraints::with_selector(q_gcd, [("a_cur = 0 or b_cur = 0", a_cur*b_cur)])
+            Constraints::with_selector(q_gcd, [("b_cur = 0", b_cur), ("c_cur = 0", c_cur)])
+        });
+
+        // Verify that the given row represents a GCD of 1
+        // Means only a is nonzero, and is equal to one
+        // MUST be used with q_gcd for final state check, and q_euclid for valid transition check
+        meta.create_gate("coprime check", |meta| {
+            let q_coprime = meta.query_selector(q_coprime);
+
+            let a_cur = meta.query_advice(a, Rotation::cur()); // GCD
+
+            Constraints::with_selector(
+                q_coprime,
+                [("a_cur = 1", Expression::Constant(F::from(1)) - a_cur)],
+            )
         });
 
         // Verify that the provided LCM = a * b / GCD(a, b)
@@ -109,10 +127,12 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
             let a_next = meta.query_advice(a, Rotation::next()); // GCD
             let b_next = meta.query_advice(b, Rotation::next()); // LCM
 
-
             Constraints::with_selector(
                 q_lcm,
-                [("lcm * gcd == a_cur * b_cur", a_cur * b_cur - a_next * b_next)],
+                [(
+                    "lcm * gcd == a_cur * b_cur",
+                    a_cur * b_cur - a_next * b_next,
+                )],
             )
         });
 
@@ -147,6 +167,7 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
             q_range,
             q_euclid,
             q_gcd,
+            q_coprime,
             q_lcm,
         }
     }
@@ -186,6 +207,7 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
         mut layouter: impl Layouter<F>,
         a: u128,
         b: u128,
+        coprime: bool, // if true, checks if GCD is 1
     ) -> Result<
         (
             (
@@ -237,9 +259,11 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
                     self.q_range.enable(&mut region, offset + i + 1)?;
 
                     // enable the GCD check on that last row
-                    if i == euclid_steps.len() - 1 {
-                        println!("Success");
+                    if i == euclid_steps.len() - 2 {
                         self.q_gcd.enable(&mut region, offset + i + 1)?;
+                        if coprime {
+                            self.q_coprime.enable(&mut region, offset + i + 1)?;
+                        }
                     }
 
                     cell_a = region.assign_advice(
@@ -277,12 +301,12 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
     ) -> Result<
         (
             (AssignedCell<F, F>, AssignedCell<F, F>), // a, b
-            (AssignedCell<F, F>, AssignedCell<F, F>) // gcd, lcm
+            (AssignedCell<F, F>, AssignedCell<F, F>), // gcd, lcm
         ),
         Error,
     > {
         let ((cell_a, cell_b), cell_gcd) =
-            self.assign_gcd(layouter.namespace(|| "Assign GCD for LCM"), a, b)?;
+            self.assign_gcd(layouter.namespace(|| "Assign GCD for LCM"), a, b, false)?;
 
         layouter.assign_region(
             || "assign LCM",
@@ -295,7 +319,7 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
 
                 let cell_a = cell_a.copy_advice(|| "a", &mut region, self.a, offset)?;
                 let cell_b = cell_b.copy_advice(|| "b", &mut region, self.b, offset)?;
-                let cell_gcd = cell_gcd.copy_advice(|| "gcd", &mut region, self.a, offset+1)?;
+                let cell_gcd = cell_gcd.copy_advice(|| "gcd", &mut region, self.a, offset + 1)?;
 
                 let cell_lcm = region.assign_advice(
                     || "lcm",
@@ -325,8 +349,14 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
 mod tests {
     use super::*;
     use gcd::*;
-    use halo2_proofs::{dev::{FailureLocation, MockProver, VerifyFailure},     pasta::Fp,
-};
+    use halo2_proofs::{
+        dev::{
+            metadata::{Column, Constraint, Gate, Region, VirtualCell},
+            FailureLocation, MockProver, VerifyFailure,
+        },
+        pasta::Fp,
+        plonk::Any,
+    };
     use rand::prelude::SliceRandom;
 
     fn sample_values_from_vec<T: Clone>(input: &Vec<T>, n: usize) -> Vec<T> {
@@ -346,39 +376,48 @@ mod tests {
     }
 
     mod test_gcd {
+        use halo2_proofs::plonk::Any;
+
         use super::*;
 
         #[derive(Default, Clone)]
         struct GcdCircuit<const RANGE: usize> {
             a: u128,
             b: u128,
+            coprime: bool,
         }
 
-        impl<F: FieldExt, const RANGE: usize> Circuit<F> for GcdCircuit<RANGE> {
-            type Config = CoprimeConfig<F, RANGE>;
+        impl<const RANGE: usize> Circuit<Fp> for GcdCircuit<RANGE> {
+            type Config = CoprimeConfig<Fp, RANGE>;
             type FloorPlanner = SimpleFloorPlanner;
 
             fn without_witnesses(&self) -> Self {
                 Self::default()
             }
 
-            fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+            fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
                 CoprimeConfig::configure(meta)
             }
 
             fn synthesize(
                 &self,
                 config: Self::Config,
-                mut layouter: impl Layouter<F>,
+                mut layouter: impl Layouter<Fp>,
             ) -> Result<(), Error> {
                 // populate the lookup table cells
                 config.range_check.load(&mut layouter)?;
 
                 // assign the full Euclid's algorithm
-                let (_, cell_gcd) =
-                    config.assign_gcd(layouter.namespace(|| "assign gcd block"), self.a, self.b)?;
-                // expose the last step which contains the GCD of the two inputs
-                config.expose_public(layouter.namespace(|| "expose the gcd"), cell_gcd, 0)?;
+                let (_, cell_gcd) = config.assign_gcd(
+                    layouter.namespace(|| "assign gcd block"),
+                    self.a,
+                    self.b,
+                    self.coprime,
+                )?;
+                // expose the last step which contains the GCD of the two inputs only if self.coprime is not already constraining it to 1
+                if !self.coprime {
+                    config.expose_public(layouter.namespace(|| "expose the gcd"), cell_gcd, 0)?;
+                }
 
                 Ok(())
             }
@@ -412,6 +451,7 @@ mod tests {
                     let circuit = GcdCircuit::<RANGE> {
                         a: i as u128,
                         b: j as u128,
+                        coprime: false,
                     };
 
                     let res = CoprimeConfig::<Fp, RANGE>::euclid_gcd_steps(i as u128, j as u128);
@@ -433,6 +473,7 @@ mod tests {
             let circuit = GcdCircuit::<RANGE> {
                 a: RANGE as u128,
                 b: RANGE as u128,
+                coprime: false,
             };
 
             let prover = MockProver::run(k, &circuit, vec![vec![Fp::from(RANGE as u64)]]).unwrap();
@@ -463,6 +504,56 @@ mod tests {
                 ])
             );
         }
+
+        #[test]
+        fn test_coprime() {
+            let k = 9;
+            const RANGE: usize = 256;
+
+            // Successful case
+            let circuit = GcdCircuit::<RANGE> {
+                a: 4 as u128,
+                b: 9 as u128,
+                coprime: true,
+            };
+
+            let prover = MockProver::run(k, &circuit, vec![vec![]]).unwrap();
+            prover.assert_satisfied();
+        }
+
+        #[test]
+        fn test_not_coprime() {
+            let k = 9;
+            const RANGE: usize = 256;
+
+            // Unsuccessful case: GCD(16, 4) = 4, not coprimes
+            let circuit = GcdCircuit::<RANGE> {
+                a: 16 as u128,
+                b: 4 as u128,
+                coprime: true,
+            };
+
+            let prover = MockProver::run(k, &circuit, vec![vec![]]).unwrap();
+
+            assert_eq!(
+                prover.verify(),
+                Err(vec![VerifyFailure::ConstraintNotSatisfied {
+                    constraint: Constraint::from((
+                        Gate::from((2, "coprime check")),
+                        0,
+                        "a_cur = 1"
+                    )),
+                    location: FailureLocation::InRegion {
+                        region: Region::from((1, "full euclidian algorithm".to_string())),
+                        offset: 1
+                    },
+                    cell_values: vec![(
+                        VirtualCell::from(("", Column::from((Any::Advice, 0)), 0)),
+                        "0x4".to_string()
+                    )]
+                }])
+            );
+        }
     }
 
     mod test_lcm {
@@ -474,28 +565,28 @@ mod tests {
             b: u128,
         }
 
-        impl<F: FieldExt, const RANGE: usize> Circuit<F> for LcmCircuit<RANGE> {
-            type Config = CoprimeConfig<F, RANGE>;
+        impl<const RANGE: usize> Circuit<Fp> for LcmCircuit<RANGE> {
+            type Config = CoprimeConfig<Fp, RANGE>;
             type FloorPlanner = SimpleFloorPlanner;
 
             fn without_witnesses(&self) -> Self {
                 Self::default()
             }
 
-            fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+            fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
                 CoprimeConfig::configure(meta)
             }
 
             fn synthesize(
                 &self,
                 config: Self::Config,
-                mut layouter: impl Layouter<F>,
+                mut layouter: impl Layouter<Fp>,
             ) -> Result<(), Error> {
                 // populate the lookup table cells
                 config.range_check.load(&mut layouter)?;
 
                 // assign the full Euclid's algorithm
-                let (_, (_ ,cell_lcm)) =
+                let (_, (_, cell_lcm)) =
                     config.assign_lcm(layouter.namespace(|| "assign lcm block"), self.a, self.b)?;
                 // expose the last step which contains the GCD of the two inputs
                 config.expose_public(layouter.namespace(|| "expose the lcm"), cell_lcm, 0)?;
