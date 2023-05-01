@@ -28,7 +28,6 @@ use table::*;
 // | gcd(a, b) | lcm(a,b) |            | 0        | 0     | 0         | 0     | 0        |
 // +-----------+----------+------------+----------+-------+-----------+-------+----------+
 
-
 #[derive(Debug, Clone)]
 pub struct CoprimeConfig<F: FieldExt, const RANGE: usize> {
     a: Column<Advice>,
@@ -61,10 +60,11 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
         let range_check = RangeTableConfig::<F, RANGE>::configure(meta);
 
         let q_range = meta.complex_selector();
-        let q_euclid = meta.selector();
-        let q_gcd = meta.selector();
-        let q_coprime = meta.selector();
         let q_lcm = meta.selector();
+
+        let q_euclid = meta.complex_selector();
+        let q_gcd = meta.complex_selector();
+        let q_coprime = meta.complex_selector();
 
         // Verify that this is a valid Euclid's algorithm step
         // No overflows possible in the constraints as long as RANGE doesn't exceed p/2
@@ -93,27 +93,22 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
         // Verify that the given row is a final state of a Euclid algorithm
         // Means only a is nonzero
         // MUST be used with q_euclid to check for valid transition
-        meta.create_gate("gcd check", |meta| {
+        meta.create_gate("gcd/coprime check", |meta| {
+            let q_euclid = meta.query_selector(q_euclid);
             let q_gcd = meta.query_selector(q_gcd);
-
-            let b_cur = meta.query_advice(b, Rotation::cur()); // 0
-            let c_cur = meta.query_advice(c, Rotation::cur()); // 0
-
-            Constraints::with_selector(q_gcd, [("b_cur = 0", b_cur), ("c_cur = 0", c_cur)])
-        });
-
-        // Verify that the given row represents a GCD of 1
-        // Means only a is nonzero, and is equal to one
-        // MUST be used with q_gcd for final state check, and q_euclid for valid transition check
-        meta.create_gate("coprime check", |meta| {
             let q_coprime = meta.query_selector(q_coprime);
 
             let a_cur = meta.query_advice(a, Rotation::cur()); // GCD
+            let b_cur = meta.query_advice(b, Rotation::cur()); // 0
+            let c_cur = meta.query_advice(c, Rotation::cur()); // 0
 
-            Constraints::with_selector(
-                q_coprime,
-                [("a_cur = 1", Expression::Constant(F::from(1)) - a_cur)],
-            )
+            vec![
+                q_gcd.clone() * b_cur,                                          // b_cur = 0
+                q_gcd.clone() * c_cur,                                          // c_cur = 0
+                q_coprime.clone() * (Expression::Constant(F::from(1)) - a_cur), // a_cur = GCD(a, b) = 1
+                q_gcd.clone() * (q_euclid - Expression::Constant(F::from(1))), // q_gcd can only be 1 if q_euclid is 1
+                q_coprime.clone() * (q_gcd - Expression::Constant(F::from(1))), // q_coprime can only be 1 if q_gcd is 1
+            ]
         });
 
         // Verify that the provided LCM = a * b / GCD(a, b)
@@ -539,9 +534,9 @@ mod tests {
                 prover.verify(),
                 Err(vec![VerifyFailure::ConstraintNotSatisfied {
                     constraint: Constraint::from((
-                        Gate::from((2, "coprime check")),
-                        0,
-                        "a_cur = 1"
+                        Gate::from((1, "gcd/coprime check")),
+                        2,
+                        ""
                     )),
                     location: FailureLocation::InRegion {
                         region: Region::from((1, "full euclidian algorithm".to_string())),
