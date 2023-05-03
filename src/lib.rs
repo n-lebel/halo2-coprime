@@ -1,1 +1,2 @@
 mod coprime;
+mod table;
