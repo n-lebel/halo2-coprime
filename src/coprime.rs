@@ -1,20 +1,20 @@
 use halo2_proofs::circuit::Value;
 use halo2_proofs::{
     arithmetic::FieldExt,
-    circuit::{AssignedCell, Layouter, SimpleFloorPlanner},
+    circuit::{AssignedCell, Layouter},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Constraints, Error, Expression, Instance,
+        Advice, Column, ConstraintSystem, Constraints, Error, Expression, Instance,
         Selector,
     },
     poly::Rotation,
 };
 
-mod table;
-use table::*;
+use crate::table::*;
 
 /// This module assigns the GCD of two integers through Euclid's algorithm,
-/// and assigns the LCM in another region. The results can be then exposed
-/// in an instance column.
+/// and assigns the LCM in another region. The GCD can be constrained to 1,
+/// forcing (a, b) to be coprimes. Any results can be exposed in an instance
+/// column.
 ///
 // +-----------+----------+------------+----------+-------+-----------+-------+----------+
 // | col_a     | col_b    | col_c      | q_euclid | q_gcd | q_coprime | q_lcm | q_lookup |
@@ -59,12 +59,13 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
 
         let range_check = RangeTableConfig::<F, RANGE>::configure(meta);
 
-        let q_range = meta.complex_selector();
         let q_lcm = meta.selector();
+        let q_coprime = meta.selector();
 
         let q_euclid = meta.complex_selector();
         let q_gcd = meta.complex_selector();
-        let q_coprime = meta.complex_selector();
+        let q_range = meta.complex_selector();
+
 
         // Verify that this is a valid Euclid's algorithm step
         // No overflows possible in the constraints as long as RANGE doesn't exceed p/2
@@ -344,13 +345,12 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
 mod tests {
     use super::*;
     use gcd::*;
-    use halo2_proofs::{
+    use halo2_proofs::{circuit::SimpleFloorPlanner, plonk::Circuit,
         dev::{
             metadata::{Column, Constraint, Gate, Region, VirtualCell},
             FailureLocation, MockProver, VerifyFailure,
         },
         pasta::Fp,
-        plonk::Any,
     };
     use rand::prelude::SliceRandom;
 
