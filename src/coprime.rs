@@ -2,10 +2,7 @@ use halo2_proofs::circuit::Value;
 use halo2_proofs::{
     arithmetic::FieldExt,
     circuit::{AssignedCell, Layouter},
-    plonk::{
-        Advice, Column, ConstraintSystem, Constraints, Error, Expression, Instance,
-        Selector,
-    },
+    plonk::{Advice, Column, ConstraintSystem, Constraints, Error, Expression, Instance, Selector},
     poly::Rotation,
 };
 
@@ -32,14 +29,14 @@ use crate::table::*;
 pub struct CoprimeConfig<F: FieldExt, const RANGE: usize> {
     a: Column<Advice>,
     b: Column<Advice>,
-    c: Column<Advice>,
 
     exp: Column<Instance>,
 
     range_check: RangeTableConfig<F, RANGE>,
 
     q_range: Selector,
-    q_euclid: Selector,
+    q_euclid_init: Selector,
+    q_euclid_ss: Selector,
     q_gcd: Selector,
     q_coprime: Selector,
     q_lcm: Selector,
@@ -49,7 +46,6 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
     fn configure(meta: &mut ConstraintSystem<F>) -> Self {
         let a = meta.advice_column();
         let b = meta.advice_column();
-        let c = meta.advice_column();
 
         let exp = meta.instance_column();
 
@@ -62,32 +58,49 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
         let q_lcm = meta.selector();
         let q_coprime = meta.selector();
 
-        let q_euclid = meta.complex_selector();
+        let q_euclid_init = meta.complex_selector();
+        let q_euclid_ss = meta.complex_selector();
         let q_gcd = meta.complex_selector();
         let q_range = meta.complex_selector();
 
-
         // Verify that this is a valid Euclid's algorithm step
         // No overflows possible in the constraints as long as RANGE doesn't exceed p/2
-        meta.create_gate("euclid's algorithm check", |meta| {
-            let q_euclid = meta.query_selector(q_euclid);
+        meta.create_gate("euclid's algorithm init", |meta| {
+            let q_euclid_init = meta.query_selector(q_euclid_init);
 
             let a_prev = meta.query_advice(a, Rotation::prev());
             let b_prev = meta.query_advice(b, Rotation::prev());
-            let div_prev = meta.query_advice(c, Rotation::prev());
 
             let a_cur = meta.query_advice(a, Rotation::cur());
             let b_cur = meta.query_advice(b, Rotation::cur());
 
             Constraints::with_selector(
-                q_euclid,
-                [
-                    ("a_cur == b_prev", a_cur - b_prev.clone()),
-                    (
-                        "a_prev == b_prev * div_prev + b_cur",
-                        b_prev * div_prev + b_cur - a_prev,
-                    ),
-                ],
+                q_euclid_init,
+                [(
+                    "a_prev == b_prev * a_cur + b_cur",
+                    b_prev * a_cur + b_cur - a_prev,
+                )],
+            )
+        });
+
+        meta.create_gate("steady-state euclid's algorithm", |meta| {
+            let q_euclid_ss = meta.query_selector(q_euclid_ss);
+
+            let a_2prev = meta.query_advice(a, Rotation(-2));
+            let b_2prev = meta.query_advice(b, Rotation(-2));
+
+            let a_prev = meta.query_advice(a, Rotation::prev());
+            let b_prev = meta.query_advice(b, Rotation::prev());
+
+            let a_cur = meta.query_advice(a, Rotation::cur());
+            let b_cur = meta.query_advice(b, Rotation::cur());
+
+            Constraints::with_selector(
+                q_euclid_ss,
+                [(
+                    "b_2prev == b_prev * a_cur + b_cur",
+                    b_prev * a_cur + b_cur - b_2prev,
+                )],
             )
         });
 
@@ -95,19 +108,23 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
         // Means only a is nonzero
         // MUST be used with q_euclid to check for valid transition
         meta.create_gate("gcd/coprime check", |meta| {
-            let q_euclid = meta.query_selector(q_euclid);
+            let q_euclid_init = meta.query_selector(q_euclid_init);
+            let q_euclid_ss = meta.query_selector(q_euclid_ss);
             let q_gcd = meta.query_selector(q_gcd);
             let q_coprime = meta.query_selector(q_coprime);
 
-            let a_cur = meta.query_advice(a, Rotation::cur()); // GCD
+            let a_cur = meta.query_advice(a, Rotation::cur());
             let b_cur = meta.query_advice(b, Rotation::cur()); // 0
-            let c_cur = meta.query_advice(c, Rotation::cur()); // 0
+
+            let a_prev = meta.query_advice(a, Rotation::prev());
+            let b_prev = meta.query_advice(b, Rotation::prev()); // GCD
 
             vec![
-                q_gcd.clone() * b_cur,                                          // b_cur = 0
-                q_gcd.clone() * c_cur,                                          // c_cur = 0
-                q_coprime.clone() * (Expression::Constant(F::from(1)) - a_cur), // a_cur = GCD(a, b) = 1
-                q_gcd.clone() * (q_euclid - Expression::Constant(F::from(1))), // q_gcd can only be 1 if q_euclid is 1
+                q_gcd.clone() * b_cur,                                           // b_cur = 0
+                q_coprime.clone() * (b_prev - Expression::Constant(F::from(1))), // b_cur = GCD(a, b) = 1
+                q_gcd.clone()
+                    * (q_euclid_init - Expression::Constant(F::from(1)))
+                    * (q_euclid_ss - Expression::Constant(F::from(1))), // q_gcd can only be 1 if either q_euclid_init or ss are 1
                 q_coprime.clone() * (q_gcd - Expression::Constant(F::from(1))), // q_coprime can only be 1 if q_gcd is 1
             ]
         });
@@ -147,42 +164,34 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
             vec![(q_range * b_cur, range_check.value)]
         });
 
-        meta.lookup(|meta| {
-            let q_range = meta.query_selector(q_range);
-            let c_cur = meta.query_advice(c, Rotation::cur());
-
-            vec![(q_range * c_cur, range_check.value)]
-        });
-
         CoprimeConfig {
             a,
             b,
-            c,
             exp,
             range_check,
             q_range,
-            q_euclid,
+            q_euclid_init,
+            q_euclid_ss,
             q_gcd,
             q_coprime,
             q_lcm,
         }
     }
 
-    fn euclid_gcd_steps(mut a: u128, mut b: u128) -> Vec<(u128, u128, u128)> {
-        let mut steps_data = Vec::new();
+    fn euclid_gcd_steps(mut a: u128, mut b: u128) -> Vec<(u128, u128)> {
+        // Initialize with the Euclid-init state
+        let mut result = vec![(a, b), (a / b, a % b)];
 
-        while b != 0 {
-            let quotient = a / b;
-            let remainder = a % b;
-            steps_data.push((a, b, quotient));
+        // When the modulo (b) is zero that means the algorithm is done
+        // The GCD will be in the second to last b
+        while result[result.len() - 1].1 != 0 {
+            let a = result[result.len() - 2].1 / result[result.len() - 1].1;
+            let b = result[result.len() - 2].1 % result[result.len() - 1].1;
 
-            a = b;
-            b = remainder;
+            result.push((a, b));
         }
 
-        steps_data.push((a, b, 0));
-
-        steps_data
+        result
     }
 
     fn calculate_lcm(mut a: u128, mut b: u128) -> u128 {
@@ -226,7 +235,7 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
                 self.q_range.enable(&mut region, offset)?;
 
                 // assign the first cells
-                let mut cell_a = region.assign_advice(
+                let cell_a = region.assign_advice(
                     || "a init",
                     self.a,
                     offset,
@@ -238,23 +247,21 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
                     offset,
                     || Value::known(F::from_u128(b)),
                 )?;
-                region.assign_advice(
-                    || "div init",
-                    self.c,
-                    offset,
-                    || Value::known(F::from_u128(a / b)),
-                )?;
 
                 // Store to return in the end
-                let initial_cell_a = cell_a.clone();
-                let initial_cell_b = cell_b.clone();
+                let mut column_a = vec![cell_a];
+                let mut column_b = vec![cell_b];
 
-                // iterate over the steps and assign the witness accordingly
-                for (i, (a, b, div)) in euclid_steps[1..].iter().enumerate() {
-                    self.q_euclid.enable(&mut region, offset + i + 1)?;
-                    self.q_range.enable(&mut region, offset + i + 1)?;
+                // Iterate over the steps and assign the witness accordingly
+                for (i, (a, b)) in euclid_steps[1..].iter().enumerate() {
+                    // Only enable q_euclid_init on the first step, then only q_euclid_ss
+                    if i == 0 {
+                        self.q_euclid_init.enable(&mut region, offset + i + 1)?;
+                    } else {
+                        self.q_euclid_ss.enable(&mut region, offset + i + 1)?;
+                    }
 
-                    // enable the GCD check on that last row
+                    // Enable the GCD check on that last row, and coprime check if enabled
                     if i == euclid_steps.len() - 2 {
                         self.q_gcd.enable(&mut region, offset + i + 1)?;
                         if coprime {
@@ -262,29 +269,35 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
                         }
                     }
 
-                    cell_a = region.assign_advice(
+                    // Range check is always enabled
+                    self.q_range.enable(&mut region, offset + i + 1)?;
+
+                    let cell_a = region.assign_advice(
                         || "a",
                         self.a,
                         offset + i + 1,
                         || Value::known(F::from_u128(a.clone())),
                     )?;
 
-                    region.assign_advice(
+                    let cell_b = region.assign_advice(
                         || "b",
                         self.b,
                         offset + i + 1,
                         || Value::known(F::from_u128(b.clone())),
                     )?;
 
-                    region.assign_advice(
-                        || "div",
-                        self.c,
-                        offset + i + 1,
-                        || Value::known(F::from_u128(div.clone())),
-                    )?;
+                    column_a.push(cell_a);
+                    column_b.push(cell_b);
                 }
 
-                Ok(((initial_cell_a, initial_cell_b), cell_a))
+                // We return the first two elements (a, b), and the second to last (b) which is GCD(a, b)
+                Ok((
+                    (
+                        column_a.first().unwrap().clone(),
+                        column_b.first().unwrap().clone(),
+                    ),
+                    column_b[column_b.len() - 2].clone(),
+                ))
             },
         )
     }
@@ -345,12 +358,14 @@ impl<F: FieldExt, const RANGE: usize> CoprimeConfig<F, RANGE> {
 mod tests {
     use super::*;
     use gcd::*;
-    use halo2_proofs::{circuit::SimpleFloorPlanner, plonk::Circuit,
+    use halo2_proofs::{
+        circuit::SimpleFloorPlanner,
         dev::{
             metadata::{Column, Constraint, Gate, Region, VirtualCell},
             FailureLocation, MockProver, VerifyFailure,
         },
         pasta::Fp,
+        plonk::Circuit,
     };
     use rand::prelude::SliceRandom;
 
@@ -425,11 +440,12 @@ mod tests {
             for i in sample_values_from_vec(&(1..RANGE).collect(), 5000) {
                 for j in sample_values_from_vec(&(1..RANGE).collect(), 5000) {
                     let res = CoprimeConfig::<Fp, RANGE>::euclid_gcd_steps(i as u128, j as u128);
-                    let (a, b, _) = res.last().unwrap();
+                    let (_, b_last) = res.last().unwrap();
+                    let (_, b_prev) = res[res.len() - 2];
                     let gcd = euclid_u128(i as u128, j as u128);
 
-                    assert_eq!(a, &gcd);
-                    assert_eq!(b, &0);
+                    assert_eq!(b_prev, gcd);
+                    assert_eq!(b_last, &0);
                 }
             }
         }
@@ -450,13 +466,9 @@ mod tests {
                     };
 
                     let res = CoprimeConfig::<Fp, RANGE>::euclid_gcd_steps(i as u128, j as u128);
-                    let (a, b, c) = res.last().unwrap();
+                    let (a, b) = res[res.len() - 2];
 
-                    let instance = vec![vec![
-                        Fp::from_u128(a.clone()),
-                        Fp::from_u128(b.clone()),
-                        Fp::from_u128(c.clone()),
-                    ]];
+                    let instance = vec![vec![Fp::from_u128(b.clone())]];
                     let prover = MockProver::<Fp>::run(k, &circuit, instance).unwrap();
 
                     prover.assert_satisfied();
@@ -472,32 +484,7 @@ mod tests {
             };
 
             let prover = MockProver::run(k, &circuit, vec![vec![Fp::from(RANGE as u64)]]).unwrap();
-            assert_eq!(
-                prover.verify(),
-                Err(vec![
-                    VerifyFailure::Lookup {
-                        lookup_index: 0,
-                        location: FailureLocation::InRegion {
-                            region: (1, "full euclidian algorithm").into(),
-                            offset: 0
-                        }
-                    },
-                    VerifyFailure::Lookup {
-                        lookup_index: 0,
-                        location: FailureLocation::InRegion {
-                            region: (1, "full euclidian algorithm").into(),
-                            offset: 1
-                        }
-                    },
-                    VerifyFailure::Lookup {
-                        lookup_index: 1,
-                        location: FailureLocation::InRegion {
-                            region: (1, "full euclidian algorithm").into(),
-                            offset: 0
-                        }
-                    }
-                ])
-            );
+            assert!(prover.verify().is_err());
         }
 
         #[test]
@@ -530,24 +517,7 @@ mod tests {
 
             let prover = MockProver::run(k, &circuit, vec![vec![]]).unwrap();
 
-            assert_eq!(
-                prover.verify(),
-                Err(vec![VerifyFailure::ConstraintNotSatisfied {
-                    constraint: Constraint::from((
-                        Gate::from((1, "gcd/coprime check")),
-                        2,
-                        ""
-                    )),
-                    location: FailureLocation::InRegion {
-                        region: Region::from((1, "full euclidian algorithm".to_string())),
-                        offset: 1
-                    },
-                    cell_values: vec![(
-                        VirtualCell::from(("", Column::from((Any::Advice, 0)), 0)),
-                        "0x4".to_string()
-                    )]
-                }])
-            );
+            assert!(prover.verify().is_err());
         }
     }
 
@@ -638,32 +608,8 @@ mod tests {
 
             let prover =
                 MockProver::run(k, &circuit, vec![vec![Fp::from_u128(RANGE as u128)]]).unwrap();
-            assert_eq!(
-                prover.verify(),
-                Err(vec![
-                    VerifyFailure::Lookup {
-                        lookup_index: 0,
-                        location: FailureLocation::InRegion {
-                            region: (1, "full euclidian algorithm").into(),
-                            offset: 0
-                        }
-                    },
-                    VerifyFailure::Lookup {
-                        lookup_index: 0,
-                        location: FailureLocation::InRegion {
-                            region: (1, "full euclidian algorithm").into(),
-                            offset: 1
-                        }
-                    },
-                    VerifyFailure::Lookup {
-                        lookup_index: 1,
-                        location: FailureLocation::InRegion {
-                            region: (1, "full euclidian algorithm").into(),
-                            offset: 0
-                        }
-                    }
-                ])
-            );
+                
+            assert!(prover.verify().is_err());
         }
     }
 }
